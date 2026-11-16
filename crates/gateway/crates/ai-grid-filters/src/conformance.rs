@@ -31,6 +31,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use grid_signals::LoadStore;
 
+mod closed_loop;
 mod revisions;
 
 use crate::{

@@ -656,6 +656,12 @@ mod tests {
     /// A share at or above this is a pin rather than a spread.
     const CEILING: f64 = 0.9;
 
+    /// Refreshes the last site holds a backlog for in `after_a_busy_spell`, long enough to read full.
+    const SPELL: i64 = 24;
+
+    /// Idle refreshes after the spell: past the window, then sixty more samples.
+    const RECOVERY: i64 = WINDOW_MS / REFRESH_MS + 60;
+
     /// Accepting topology before telemetry keeps capacity unknown until a sample arrives.
     #[test]
     fn topology_can_arrive_before_telemetry() {
@@ -2607,6 +2613,30 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "reproduces saturation residues ranking idle sites: smoothing never reaches zero and \
+                two choices compares saturation strictly, so the site busy last takes nothing"]
+    fn a_site_back_to_idle_takes_its_share_again() {
+        for recovery in [RECOVERY, 10 * RECOVERY] {
+            let (sites, snapshot) = after_a_busy_spell(SPELL, recovery);
+            capacity_tracking(&observed(&sites, &snapshot), UNIT_TOLERANCE).unwrap_or_else(|error| {
+                panic!("idle for {recovery} refreshes after the spell, every site takes its share: {error}")
+            });
+        }
+    }
+
+    #[test]
+    fn the_residue_scenario_turns_on_the_spell() {
+        let (sites, without) = after_a_busy_spell(0, RECOVERY);
+        capacity_tracking(&observed(&sites, &without), UNIT_TOLERANCE)
+            .expect("without the spell every site takes its share");
+        let (_, during) = after_a_busy_spell(SPELL, 0);
+        assert!(
+            capacity_tracking(&observed(&sites, &during), UNIT_TOLERANCE).is_err(),
+            "a site holding a backlog took its capacity share, so the scenario cannot see load"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Test Utilities
     // ---------------------------------------------------------------------------
@@ -2646,6 +2676,45 @@ mod tests {
             snapshot = grid.order(sites, at_ms);
         }
         snapshot
+    }
+
+    /// Three equal sites taught their capacity and left idle past the window, then the last
+    /// holds its capacity with a backlog for `spell` refreshes while the others stay idle, then
+    /// all three stay idle for `recovery` refreshes. `spell` zero is the same run without it.
+    fn after_a_busy_spell(spell: i64, recovery: i64) -> (Vec<SiteSpec>, RouteSnapshot) {
+        let sites = EQUAL_CAPACITY[..3].to_vec();
+        let (quiet, busy) = sites.split_at(2);
+        let mut grid = Harness::new(WINDOW_MS);
+        grid.publish(&sites, NOW_MS, |spec| spec.capacity, 0.0);
+        let mut snapshot = grid.order(&sites, NOW_MS);
+        let mut at_ms = NOW_MS;
+        let phases = [
+            (WINDOW_MS / REFRESH_MS + SETTLE, false),
+            (spell, true),
+            (recovery, false),
+        ];
+        for (refreshes, loaded) in phases {
+            for _ in 0..refreshes {
+                at_ms += REFRESH_MS;
+                let (held, queued) = if loaded { (busy[0].capacity, 2.0) } else { (0.0, 0.0) };
+                grid.publish(quiet, at_ms, |_| 0.0, 0.0);
+                grid.publish(busy, at_ms, |_| held, queued);
+                snapshot = grid.order(&sites, at_ms);
+            }
+        }
+        (sites, snapshot)
+    }
+
+    /// What each site takes of `DRAWS` requests over `snapshot`.
+    fn observed(sites: &[SiteSpec], snapshot: &RouteSnapshot) -> Vec<Observed> {
+        sites
+            .iter()
+            .map(|spec| Observed {
+                site: spec.site.to_owned(),
+                capacity: spec.capacity,
+                dispatched: routed_to(snapshot, spec.site),
+            })
+            .collect()
     }
 
     /// Attribute real selector decisions to a pool rather than inspecting its weight alone.

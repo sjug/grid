@@ -432,7 +432,7 @@ impl PrefixIndex {
 
     /// Keys held for `candidate`.
     #[cfg(test)]
-    fn len(&self, candidate: &str) -> usize {
+    pub(crate) fn len(&self, candidate: &str) -> usize {
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         index
             .candidates

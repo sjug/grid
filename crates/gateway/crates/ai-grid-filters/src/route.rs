@@ -1653,6 +1653,35 @@ pub(crate) mod tests {
     /// Fixed wall-clock instant used by routing tests.
     const TEST_NOW_MS: i64 = 1_000;
 
+    /// Conversations, keys per backend cluster, and stickiness threshold for each sweep run.
+    const SWEEP: [(usize, usize, f64); 13] = [
+        (256, 16_384, 0.8),
+        (1_024, 16_384, 0.8),
+        (4_096, 16_384, 0.8),
+        (256, 65_536, 0.8),
+        (1_024, 65_536, 0.8),
+        (4_096, 65_536, 0.8),
+        (256, 131_072, 0.8),
+        (1_024, 131_072, 0.8),
+        (4_096, 131_072, 0.8),
+        (256, 262_144, 0.8),
+        (1_024, 262_144, 0.8),
+        (4_096, 262_144, 0.8),
+        (256, 16_384, 0.5),
+    ];
+
+    /// The sites a sweep spreads conversations over.
+    const SWEPT_SITES: [&str; 3] = ["east", "west", "north"];
+
+    /// Turns in each swept conversation.
+    const TURNS: usize = 8;
+
+    /// Bytes of text in each user message.
+    const USER_BYTES: usize = 4_096;
+
+    /// Bytes of text in each assistant reply.
+    const REPLY_BYTES: usize = 64;
+
     /// The pick for `kind` and `name` over `candidates` in their given order.
     fn front(candidates: Vec<RouteCandidate>, kind: CapabilityKind, name: &str) -> Option<String> {
         let snapshot = RouteSnapshot::from_static(candidates, Arc::from("east"));
@@ -3801,9 +3830,112 @@ pub(crate) mod tests {
         assert_eq!(ctx.cluster.as_deref(), Some("local-pool"));
     }
 
+    #[tokio::test]
+    #[ignore = "characterization, not a check: run with --ignored --nocapture in release"]
+    #[expect(clippy::print_stdout, reason = "reports the sweep")]
+    async fn prefix_locality_by_conversations_and_index_capacity() {
+        println!(
+            "{} sites with equal room; {TURNS} turns, each a {USER_BYTES} B user message after a {REPLY_BYTES} B \
+             reply; every conversation takes a turn before any takes the next",
+            SWEPT_SITES.len()
+        );
+        println!(
+            "conversations  capacity  threshold  share of turns 2 to {TURNS} sent to the previous turn's site  keys \
+             held per cluster"
+        );
+        for (conversations, capacity, threshold) in SWEEP {
+            let (stayed, held) = locality(conversations, capacity, threshold).await;
+            let stayed: Vec<String> = stayed.iter().map(|share| format!("{share:.3}")).collect();
+            println!(
+                "{conversations:>13}  {capacity:>8}  {threshold:>9}  {}  {held:?}",
+                stayed.join(" ")
+            );
+        }
+    }
+
     // ---------------------------------------------------------------------------
     // Test Utilities
     // ---------------------------------------------------------------------------
+
+    /// For each turn from the second, the share the filter sent to the previous turn's site, and the
+    /// keys each cluster's index holds, after `conversations` conversations of [`TURNS`] turns through
+    /// the filter, each answered with 200, at index `capacity` and stickiness `threshold`.
+    async fn locality(conversations: usize, capacity: usize, threshold: f64) -> (Vec<f64>, Vec<usize>) {
+        let candidates: Vec<RouteCandidate> = SWEPT_SITES
+            .iter()
+            .flat_map(|site| {
+                let mut candidates = one("llama", site, &format!("pool-{site}"), OPEN);
+                for candidate in &mut candidates {
+                    candidate.capacity = Some(8.0);
+                    candidate.rho = Some(0.1);
+                    candidate.backlog = Some(false);
+                }
+                candidates
+            })
+            .collect();
+        let clusters: Vec<Arc<str>> = candidates
+            .iter()
+            .map(|candidate| Arc::clone(&candidate.cluster))
+            .collect();
+        let mut snapshot = RouteSnapshot::from_static(candidates, Arc::from("local"));
+        snapshot.scores.fill(0.0);
+        let settings = AffinitySettings {
+            capacity: std::num::NonZeroUsize::new(capacity).expect("nonzero"),
+            threshold,
+            ..AffinitySettings::default()
+        };
+        let filter = filter(snapshot, settings.clone());
+        filter.affinity.index.apply(&settings, &clusters);
+        let request = llama_request("/v1/chat/completions");
+        let mut served: Vec<Option<String>> = vec![None; conversations];
+        let mut stayed = [0_u32; TURNS];
+        for turn in 1..=TURNS {
+            for (conversation, previous) in served.iter_mut().enumerate() {
+                let mut body = Some(Bytes::from(conversation_body(conversation, turn)));
+                let mut head = praxis_filter::Response {
+                    headers: http::HeaderMap::new(),
+                    status: http::StatusCode::OK,
+                };
+                let mut ctx = context(&request);
+                drop(filter.on_request_body(&mut ctx, &mut body, true).await.expect("reads"));
+                drop(filter.on_request(&mut ctx).await.expect("routes"));
+                let site = ctx.cluster.as_deref().expect("routed").to_owned();
+                ctx.upstream_reached = true;
+                ctx.response_header = Some(&mut head);
+                drop(filter.on_response(&mut ctx).await.expect("settles"));
+                if previous.replace(site.clone()).is_some_and(|previous| previous == site) {
+                    stayed[turn - 1] += 1;
+                }
+            }
+        }
+        let total = f64::from(u32::try_from(conversations).expect("conversations fit u32"));
+        let held = clusters
+            .iter()
+            .map(|cluster| filter.affinity.index.len(cluster))
+            .collect();
+        (
+            stayed.iter().skip(1).map(|count| f64::from(*count) / total).collect(),
+            held,
+        )
+    }
+
+    /// The Chat Completions body of `conversation`'s `turn`: every earlier user message and reply,
+    /// then this turn's user message, each led by the conversation so no two conversations share a block.
+    fn conversation_body(conversation: usize, turn: usize) -> String {
+        let text = |kind: &str, at: usize, bytes: usize| {
+            let lead = format!("conversation {conversation} {kind} {at}: ");
+            let fill = "routing, caching and load ".repeat(bytes / 26 + 1);
+            format!("{lead}{fill}").chars().take(bytes).collect::<String>()
+        };
+        let mut messages = Vec::new();
+        for at in 1..=turn {
+            messages.push(serde_json::json!({"role": "user", "content": text("user", at, USER_BYTES)}));
+            if at < turn {
+                messages.push(serde_json::json!({"role": "assistant", "content": text("reply", at, REPLY_BYTES)}));
+            }
+        }
+        serde_json::json!({"model": "llama", "messages": messages}).to_string()
+    }
 
     /// The request id source every test context shares.
     static IDS: LazyLock<praxis_core::id::IdGenerator> = LazyLock::new(|| praxis_core::id::IdGenerator::with_seed(0));

@@ -62,7 +62,7 @@ const HORIZON_SCRAPES: u32 = 3;
 /// defaults. Sized shorter than one relay cycle, every remote site would be
 /// unmeasured for most of every cycle and every gateway would route to its local
 /// site in a square wave.
-fn load_window_ms(scrape: Duration, peer_interval: Duration, peer_budget: Duration) -> i64 {
+pub(crate) fn load_window_ms(scrape: Duration, peer_interval: Duration, peer_budget: Duration) -> i64 {
     let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
     let window = ms(scrape)
         .saturating_add(ms(peer_interval))

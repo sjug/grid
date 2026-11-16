@@ -3217,6 +3217,61 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_peer_at_the_provider_cap_has_every_provider_kept() {
+        crate::init_process_crypto();
+        let (date, at_ms) = dated(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let round = poll_one_peer("at-cap", load_rows(&capped_providers(), at_ms), date).await;
+        assert_eq!(
+            providers_in(&round, "at-cap"),
+            capped_providers().into_iter().collect(),
+            "every provider at the cap is kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn rows_older_than_the_window_read_as_cut_off() {
+        crate::init_process_crypto();
+        let providers = capped_providers();
+        let stale_ms = window_ms().saturating_add(interval_ms());
+        let mut rounds = vec![(providers.as_slice(), 0)];
+        rounds.extend(std::iter::repeat_n(
+            (providers.as_slice(), stale_ms),
+            rounds_past_window(),
+        ));
+        let cut = first_cut_off(&newest_by_round("stale-rows", &rounds).await);
+        assert!(
+            cut.as_ref().is_some_and(|(_, cut)| cut.len() == providers.len()),
+            "rows delivered every round but older than the window are cut off: {cut:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "reproduces the per-peer cap keeping the first providers by name in every round: one \
+                added past the cap that sorts earlier cuts off a provider already delivered"]
+    async fn a_provider_added_past_the_cap_does_not_cut_off_one_already_delivered() {
+        crate::init_process_crypto();
+        let before = capped_providers();
+        let mut after = before.clone();
+        after.push("pool-added".to_owned());
+        let mut rounds = vec![(before.as_slice(), 0)];
+        rounds.extend(std::iter::repeat_n((after.as_slice(), 0), rounds_past_window()));
+        let newest = newest_by_round("past-cap", &rounds).await;
+        assert_eq!(
+            newest
+                .first()
+                .map(|(_, delivered)| delivered.keys().cloned().collect::<Vec<_>>()),
+            Some(before.clone()),
+            "at the cap every provider is delivered"
+        );
+        assert_eq!(
+            first_cut_off(&newest),
+            None,
+            "every provider already delivered keeps a sample newer than the {} ms freshness window",
+            window_ms()
+        );
+    }
+
     /// `n` lines of one contract series for `target`, under distinct labels.
     fn stocked(target: &str, n: usize) -> (String, Vec<Observation>) {
         let samples = (0..n)
@@ -3342,6 +3397,101 @@ mod tests {
             answering: true,
             alias: None,
         }
+    }
+
+    /// The operator's default signal cadence: provider scrape, peer poll interval and peer poll budget.
+    const CADENCE: (Duration, Duration, Duration) =
+        (Duration::from_secs(1), Duration::from_secs(5), Duration::from_secs(10));
+
+    /// The freshness window the gateway reads load over at [`CADENCE`], milliseconds.
+    fn window_ms() -> i64 {
+        let (scrape, interval, budget) = CADENCE;
+        crate::resources::serving_config::load_window_ms(scrape, interval, budget)
+    }
+
+    /// The peer poll interval at [`CADENCE`], milliseconds.
+    fn interval_ms() -> i64 {
+        i64::try_from(CADENCE.1.as_millis()).expect("fits i64")
+    }
+
+    /// Rounds after the first that carry a run past one freshness window.
+    fn rounds_past_window() -> usize {
+        usize::try_from(
+            window_ms()
+                .checked_div(interval_ms())
+                .expect("a nonzero interval")
+                .saturating_add(2),
+        )
+        .expect("fits usize")
+    }
+
+    /// Poll `peer` once per round, back to back, each round's `Date` one [`CADENCE`] interval of
+    /// simulated time after the last and its providers' rows stamped that many milliseconds behind
+    /// it, and return each round's time with the newest sample time it delivered per provider: the
+    /// round's `Date` less the row's age.
+    async fn newest_by_round(peer: &str, rounds: &[(&[String], i64)]) -> Vec<(i64, BTreeMap<String, i64>)> {
+        let poll = one_attempt();
+        let start = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut newest = Vec::with_capacity(rounds.len());
+        for (round, (providers, lag_ms)) in rounds.iter().enumerate() {
+            let (date, now_ms) = dated(start + CADENCE.1.saturating_mul(u32::try_from(round).expect("fits u32")));
+            let body = load_rows(providers, now_ms.saturating_sub(*lag_ms));
+            let polled = poll.collect(&[dated_peer(peer, body, date).await]).await;
+            let mut delivered = BTreeMap::<String, i64>::new();
+            for row in polled.get(peer).into_iter().flatten() {
+                if let Some(provider) = row.labels.get(PROVIDER_LABEL) {
+                    let sampled = now_ms.saturating_sub(i64::try_from(row.age.as_millis()).expect("fits i64"));
+                    let held = delivered.entry(provider.clone()).or_insert(sampled);
+                    *held = (*held).max(sampled);
+                }
+            }
+            newest.push((now_ms, delivered));
+        }
+        newest
+    }
+
+    /// The first round at which a provider delivered earlier has no sample newer than the
+    /// freshness window, with those providers.
+    fn first_cut_off(rounds: &[(i64, BTreeMap<String, i64>)]) -> Option<(usize, Vec<String>)> {
+        let mut newest = BTreeMap::<&str, i64>::new();
+        rounds.iter().enumerate().find_map(|(round, (now_ms, delivered))| {
+            for (provider, sampled) in delivered {
+                let held = newest.entry(provider.as_str()).or_insert(*sampled);
+                *held = (*held).max(*sampled);
+            }
+            let cut: Vec<String> = newest
+                .iter()
+                .filter(|(_, sampled)| now_ms.saturating_sub(**sampled) > window_ms())
+                .map(|(provider, _)| (*provider).to_owned())
+                .collect();
+            (!cut.is_empty()).then_some((round, cut))
+        })
+    }
+
+    /// [`MAX_PEER_PROVIDERS`] provider names, the last of them sorting after every other.
+    fn capped_providers() -> Vec<String> {
+        (1..MAX_PEER_PROVIDERS)
+            .map(|i| format!("pool-{i:03}"))
+            .chain(std::iter::once("pool-serving".to_owned()))
+            .collect()
+    }
+
+    /// One load row stamped `at_ms` for each of `providers`, as a peer serves them.
+    fn load_rows(providers: &[String], at_ms: i64) -> String {
+        providers
+            .iter()
+            .map(|provider| format!("inference_pool_average_queue_size{{grid_provider=\"{provider}\"}} 1 {at_ms}\n"))
+            .collect()
+    }
+
+    /// The providers `round` kept for `peer`.
+    fn providers_in(round: &BTreeMap<String, Vec<Observation>>, peer: &str) -> std::collections::BTreeSet<String> {
+        round
+            .get(peer)
+            .into_iter()
+            .flatten()
+            .filter_map(|row| row.labels.get(PROVIDER_LABEL).cloned())
+            .collect()
     }
 
     /// A poller that tries each peer once.

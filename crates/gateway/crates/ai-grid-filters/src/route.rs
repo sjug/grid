@@ -3853,6 +3853,52 @@ pub(crate) mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_conversation_pressed_off_its_site_stays_where_it_moved_after_the_pressure_lifts() {
+        let filter = swept_filter(&steady());
+        let request = llama_request("/v1/chat/completions");
+        let mut sites = Vec::new();
+        for turn in 1..=4 {
+            sites.push(send_turn(&filter, &request, 0, turn).await);
+        }
+        let held = sites[1].clone();
+        assert_eq!(sites[2..4], [held.clone(), held.clone()], "turns 3 and 4 stay on {held}: {sites:?}");
+        filter.snapshot.store(Arc::new(swept_snapshot(Some(&held))));
+        for turn in 5..=6 {
+            sites.push(send_turn(&filter, &request, 0, turn).await);
+        }
+        let moved = sites[4].clone();
+        assert_ne!(moved, held, "a backlog at {held} moves turn 5 off it: {sites:?}");
+        assert_eq!(sites[5], moved, "turn 6 stays on {moved}, where turn 5 went: {sites:?}");
+        filter.snapshot.store(Arc::new(swept_snapshot(None)));
+        for turn in 7..=8 {
+            sites.push(send_turn(&filter, &request, 0, turn).await);
+        }
+        assert_eq!(
+            sites[6..8],
+            [moved.clone(), moved.clone()],
+            "once {held} has room again, turns 7 and 8 stay on {moved}, which holds the longer prefix: {sites:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn after_a_restart_a_conversation_is_placed_by_load_once_then_stays() {
+        let request = llama_request("/v1/chat/completions");
+        let before = swept_filter(&steady());
+        for turn in 1..=4 {
+            drop(send_turn(&before, &request, 0, turn).await);
+        }
+        let after = swept_filter(&steady());
+        let mut sites = Vec::new();
+        for turn in 5..=8 {
+            sites.push(send_turn(&after, &request, 0, turn).await);
+        }
+        assert!(
+            sites.iter().all(|site| *site == sites[0]),
+            "with a fresh index turn 5 is placed by load and turns 6 to 8 stay with it: {sites:?}"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Test Utilities
     // ---------------------------------------------------------------------------
@@ -3861,6 +3907,35 @@ pub(crate) mod tests {
     /// keys each cluster's index holds, after `conversations` conversations of [`TURNS`] turns through
     /// the filter, each answered with 200, at index `capacity` and stickiness `threshold`.
     async fn locality(conversations: usize, capacity: usize, threshold: f64) -> (Vec<f64>, Vec<usize>) {
+        let filter = swept_filter(&AffinitySettings {
+            capacity: std::num::NonZeroUsize::new(capacity).expect("nonzero"),
+            threshold,
+            ..AffinitySettings::default()
+        });
+        let request = llama_request("/v1/chat/completions");
+        let mut served: Vec<Option<String>> = vec![None; conversations];
+        let mut stayed = [0_u32; TURNS];
+        for turn in 1..=TURNS {
+            for (conversation, previous) in served.iter_mut().enumerate() {
+                let site = send_turn(&filter, &request, conversation, turn).await;
+                if previous.replace(site.clone()).is_some_and(|previous| previous == site) {
+                    stayed[turn - 1] += 1;
+                }
+            }
+        }
+        let total = f64::from(u32::try_from(conversations).expect("conversations fit u32"));
+        let held = SWEPT_SITES
+            .iter()
+            .map(|site| filter.affinity.index.len(&format!("pool-{site}")))
+            .collect();
+        (
+            stayed.iter().skip(1).map(|count| f64::from(*count) / total).collect(),
+            held,
+        )
+    }
+
+    /// `llama` at each of [`SWEPT_SITES`] with equal room, except `pressed`, which has a backlog.
+    fn swept_snapshot(pressed: Option<&str>) -> RouteSnapshot {
         let candidates: Vec<RouteCandidate> = SWEPT_SITES
             .iter()
             .flat_map(|site| {
@@ -3868,55 +3943,48 @@ pub(crate) mod tests {
                 for candidate in &mut candidates {
                     candidate.capacity = Some(8.0);
                     candidate.rho = Some(0.1);
-                    candidate.backlog = Some(false);
+                    candidate.backlog = Some(pressed == Some(&*candidate.cluster));
                 }
                 candidates
             })
             .collect();
-        let clusters: Vec<Arc<str>> = candidates
-            .iter()
-            .map(|candidate| Arc::clone(&candidate.cluster))
-            .collect();
         let mut snapshot = RouteSnapshot::from_static(candidates, Arc::from("local"));
         snapshot.scores.fill(0.0);
-        let settings = AffinitySettings {
-            capacity: std::num::NonZeroUsize::new(capacity).expect("nonzero"),
-            threshold,
-            ..AffinitySettings::default()
-        };
-        let filter = filter(snapshot, settings.clone());
-        filter.affinity.index.apply(&settings, &clusters);
-        let request = llama_request("/v1/chat/completions");
-        let mut served: Vec<Option<String>> = vec![None; conversations];
-        let mut stayed = [0_u32; TURNS];
-        for turn in 1..=TURNS {
-            for (conversation, previous) in served.iter_mut().enumerate() {
-                let mut body = Some(Bytes::from(conversation_body(conversation, turn)));
-                let mut head = praxis_filter::Response {
-                    headers: http::HeaderMap::new(),
-                    status: http::StatusCode::OK,
-                };
-                let mut ctx = context(&request);
-                drop(filter.on_request_body(&mut ctx, &mut body, true).await.expect("reads"));
-                drop(filter.on_request(&mut ctx).await.expect("routes"));
-                let site = ctx.cluster.as_deref().expect("routed").to_owned();
-                ctx.upstream_reached = true;
-                ctx.response_header = Some(&mut head);
-                drop(filter.on_response(&mut ctx).await.expect("settles"));
-                if previous.replace(site.clone()).is_some_and(|previous| previous == site) {
-                    stayed[turn - 1] += 1;
-                }
-            }
-        }
-        let total = f64::from(u32::try_from(conversations).expect("conversations fit u32"));
-        let held = clusters
+        snapshot
+    }
+
+    /// The filter over [`swept_snapshot`] with no site pressed, its prefix index sized by `settings`.
+    fn swept_filter(settings: &AffinitySettings) -> GridSiteRouteFilter {
+        let filter = filter(swept_snapshot(None), settings.clone());
+        let clusters: Vec<Arc<str>> = SWEPT_SITES
             .iter()
-            .map(|cluster| filter.affinity.index.len(cluster))
+            .map(|site| Arc::from(format!("pool-{site}")))
             .collect();
-        (
-            stayed.iter().skip(1).map(|count| f64::from(*count) / total).collect(),
-            held,
-        )
+        filter.affinity.index.apply(settings, &clusters);
+        filter
+    }
+
+    /// Send `conversation`'s `turn` through `filter` as `request`, answer it with 200, and return
+    /// the cluster it went to.
+    async fn send_turn(
+        filter: &GridSiteRouteFilter,
+        request: &praxis_filter::Request,
+        conversation: usize,
+        turn: usize,
+    ) -> String {
+        let mut body = Some(Bytes::from(conversation_body(conversation, turn)));
+        let mut head = praxis_filter::Response {
+            headers: http::HeaderMap::new(),
+            status: http::StatusCode::OK,
+        };
+        let mut ctx = context(request);
+        drop(filter.on_request_body(&mut ctx, &mut body, true).await.expect("reads"));
+        drop(filter.on_request(&mut ctx).await.expect("routes"));
+        let site = ctx.cluster.as_deref().expect("routed").to_owned();
+        ctx.upstream_reached = true;
+        ctx.response_header = Some(&mut head);
+        drop(filter.on_response(&mut ctx).await.expect("settles"));
+        site
     }
 
     /// The Chat Completions body of `conversation`'s `turn`: every earlier user message and reply,

@@ -80,6 +80,25 @@ fn snapshot(sites: u32, shape: Shape) -> RouteSnapshot {
     snapshot
 }
 
+/// [`snapshot`] of `sites` measured sites, behind `models - 1` other models served at the same sites.
+fn catalog(models: u32, sites: u32) -> RouteSnapshot {
+    let llama = snapshot(sites, Shape::Measured);
+    let candidates = (1..models)
+        .flat_map(|model| {
+            llama.candidates.iter().map(move |candidate| RouteCandidate {
+                cluster: Arc::from(format!("model-{model}-{}", candidate.cluster)),
+                name: Arc::from(format!("model-{model}")),
+                stable_id: Arc::from(format!("model-{model}-{}", candidate.stable_id)),
+                ..candidate.clone()
+            })
+        })
+        .chain(llama.candidates.iter().cloned())
+        .collect();
+    let mut snapshot = RouteSnapshot::from_static(candidates, Arc::clone(&llama.local_site));
+    snapshot.scores.fill(0.0);
+    snapshot
+}
+
 /// The registered `grid_site_route` filter over `snapshot`, affinity off via its filter block.
 fn filter(snapshot: RouteSnapshot) -> Result<Box<dyn HttpFilter>, FilterError> {
     let mut config = load_serving_config("testdata/serving-config.json")?;
@@ -247,6 +266,13 @@ fn provider_hop(bencher: Bencher<'_, '_>, sites: u32) {
             .collect(),
     );
     measure_fresh(bencher, snapshot);
+}
+
+/// A request for a model four sites serve, in a catalog of `models` models at those sites: up to
+/// 1,024 candidates, the most a serving config may carry.
+#[divan::bench(args = [1, 16, 64, 256])]
+fn catalog_size(bencher: Bencher<'_, '_>, models: u32) {
+    measure_fresh(bencher, catalog(models, 4));
 }
 
 /// One request per iteration on a fresh context, so growth in its buffers is counted.

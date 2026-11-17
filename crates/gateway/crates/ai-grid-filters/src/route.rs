@@ -1915,6 +1915,33 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "reproduces selection gathering the first MAX_SITES healthy candidates before the room \
+                filter: while those are all saturated, a candidate with room after them is never chosen"]
+    fn a_site_with_room_after_the_first_max_sites_takes_the_request() {
+        let snapshot = past_max_sites(MAX_SITES + 1, MAX_SITES);
+        for turn in 0..100 {
+            assert_eq!(
+                pick(&snapshot, turn),
+                format!("pool-s{MAX_SITES}"),
+                "the only site with room takes the request"
+            );
+        }
+    }
+
+    #[test]
+    fn the_only_site_with_room_within_max_sites_takes_the_request() {
+        let snapshot = past_max_sites(MAX_SITES, MAX_SITES - 1);
+        let last = MAX_SITES - 1;
+        for turn in 0..100 {
+            assert_eq!(
+                pick(&snapshot, turn),
+                format!("pool-s{last}"),
+                "the only site with room takes the request"
+            );
+        }
+    }
+
+    #[test]
     fn tied_candidates_split_evenly() {
         let snapshot = RouteSnapshot::from_static(three(), Arc::from("hub"));
         let picks: Vec<String> = (0..3_000).map(|turn| pick(&snapshot, turn)).collect();
@@ -3804,6 +3831,28 @@ pub(crate) mod tests {
     // ---------------------------------------------------------------------------
     // Test Utilities
     // ---------------------------------------------------------------------------
+
+    /// `m` at sites `s0` onwards, `count` candidates in snapshot order: the first `full` are
+    /// saturated (rho 1.0) and the rest have room, all with equal scores.
+    fn past_max_sites(count: usize, full: usize) -> RouteSnapshot {
+        let candidates = (0..count)
+            .flat_map(|index| {
+                one(
+                    "m",
+                    &format!("s{index}"),
+                    &format!("pool-s{index}"),
+                    AdmissionState::NewAndExisting,
+                )
+            })
+            .collect();
+        let mut snapshot = RouteSnapshot::from_static(candidates, Arc::from("s0"));
+        for (index, candidate) in snapshot.candidates.iter_mut().enumerate() {
+            candidate.rho = Some(if index < full { 1.0 } else { 0.3 });
+            candidate.backlog = Some(false);
+        }
+        snapshot.scores = vec![0.0; count];
+        snapshot
+    }
 
     /// The request id source every test context shares.
     static IDS: LazyLock<praxis_core::id::IdGenerator> = LazyLock::new(|| praxis_core::id::IdGenerator::with_seed(0));

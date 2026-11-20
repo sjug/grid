@@ -7,7 +7,14 @@
 //! Declared behind `#[cfg(test)]` at the `mod test_doubles;` site in
 //! `resources/mod.rs`, so this whole module compiles out of non-test builds.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use k8s_openapi::{ByteString, api::core::v1::Secret};
 
@@ -132,6 +139,59 @@ where
     kube::Client::new(service, "default")
 }
 
+/// Requests a [`counting_kube_client_with_config_map`] client has answered.
+#[derive(Default)]
+pub(crate) struct KubeReads {
+    /// GETs of the named `ConfigMap`.
+    pub(crate) named_gets: AtomicUsize,
+    /// Any other request, answered 404.
+    pub(crate) unexpected: AtomicUsize,
+}
+
+/// Build a `kube::Client` that serves `config_map` as `namespace/name` and counts what it is asked.
+///
+/// Only a GET of that object is answered with it. Every other request gets 404.
+pub(crate) fn counting_kube_client_with_config_map(
+    namespace: &str,
+    name: &str,
+    mut config_map: k8s_openapi::api::core::v1::ConfigMap,
+) -> (kube::Client, Arc<KubeReads>) {
+    config_map.metadata.name = Some(name.to_owned());
+    config_map.metadata.namespace = Some(namespace.to_owned());
+    config_map.metadata.resource_version = Some("1".to_owned());
+    let named_path = format!("/api/v1/namespaces/{namespace}/configmaps/{name}");
+    let found = serde_json::to_vec(&config_map).unwrap_or_else(|_| std::process::abort());
+    let not_found = serde_json::to_vec(&serde_json::json!({
+        "kind": "Status",
+        "apiVersion": "v1",
+        "status": "Failure",
+        "reason": "NotFound",
+        "code": 404,
+    }))
+    .unwrap_or_else(|_| std::process::abort());
+    let reads = Arc::new(KubeReads::default());
+    let counted = Arc::clone(&reads);
+    let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+        let named = request.method() == http::Method::GET && request.uri().path() == named_path;
+        let (status, body) = if named {
+            counted.named_gets.fetch_add(1, Ordering::SeqCst);
+            (200, found.clone())
+        } else {
+            counted.unexpected.fetch_add(1, Ordering::SeqCst);
+            (404, not_found.clone())
+        };
+        async move {
+            Ok::<_, std::convert::Infallible>(
+                http::Response::builder()
+                    .status(status)
+                    .body(kube::client::Body::from(body))
+                    .unwrap_or_else(|_| std::process::abort()),
+            )
+        }
+    });
+    (kube::Client::new(service, "default"), reads)
+}
+
 /// Build a Secret with a single `data` key.
 pub(crate) fn secret_with_key(key: &str, value: &[u8]) -> Secret {
     let mut data = std::collections::BTreeMap::new();
@@ -161,6 +221,84 @@ pub(crate) fn endpoint_tls_for_ca(secret_name: &str) -> crate::crd::inference_pr
         ca_config_map_ref: None,
         client_certificate_secret_ref: None,
     }
+}
+
+/// What a [`start_counting_tls_metrics_server`] endpoint has served.
+#[derive(Default)]
+pub(crate) struct TlsMetricsServed {
+    /// TLS handshakes completed.
+    pub(crate) handshakes: AtomicUsize,
+    /// `GET /metrics` requests answered.
+    pub(crate) scrapes: AtomicUsize,
+}
+
+/// Start an HTTPS metrics endpoint on localhost that keeps its connections open.
+///
+/// It answers each `GET /metrics` with `metrics` over HTTP/1.1 and anything else with 404, on
+/// either TLS backend. `ca` signs its `localhost` identity. Returns its URL and what it served.
+pub(crate) async fn start_counting_tls_metrics_server(
+    ca: &certs::CaCert,
+    metrics: &'static str,
+) -> (String, Arc<TlsMetricsServed>) {
+    let identity =
+        certs::generate_dns_cert(ca, "metrics-server", "localhost").unwrap_or_else(|_| std::process::abort());
+    let tls = crate::resources::tls_backend::build_server_config_optional_client(
+        ca.cert_pem.as_bytes(),
+        identity.cert_pem.as_bytes(),
+        identity.key_pem.as_bytes(),
+    )
+    .unwrap_or_else(|_| std::process::abort());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap_or_else(|_| std::process::abort());
+    let port = listener.local_addr().unwrap_or_else(|_| std::process::abort()).port();
+    let served = Arc::new(TlsMetricsServed::default());
+    let counted = Arc::clone(&served);
+
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(serve_metrics_connection(
+                Arc::clone(&tls),
+                stream,
+                metrics,
+                Arc::clone(&counted),
+            ));
+        }
+    });
+
+    (format!("https://localhost:{port}"), served)
+}
+
+/// Serve one connection of a [`start_counting_tls_metrics_server`] endpoint until its client leaves.
+async fn serve_metrics_connection(
+    tls: crate::resources::tls_backend::ServerTlsConfig,
+    stream: tokio::net::TcpStream,
+    metrics: &'static str,
+    served: Arc<TlsMetricsServed>,
+) {
+    let Ok(stream) = crate::resources::tls_backend::accept(stream, &tls).await else {
+        return;
+    };
+    served.handshakes.fetch_add(1, Ordering::SeqCst);
+    let service = hyper::service::service_fn(move |request: http::Request<hyper::body::Incoming>| {
+        let scrape = request.method() == http::Method::GET && request.uri().path() == "/metrics";
+        let (status, body) = if scrape {
+            served.scrapes.fetch_add(1, Ordering::SeqCst);
+            (http::StatusCode::OK, metrics)
+        } else {
+            (http::StatusCode::NOT_FOUND, "")
+        };
+        std::future::ready(
+            http::Response::builder()
+                .status(status)
+                .body(http_body_util::Full::new(bytes::Bytes::from_static(body.as_bytes()))),
+        )
+    });
+    drop(
+        hyper::server::conn::http1::Builder::new()
+            .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+            .await,
+    );
 }
 
 /// Start a one-shot HTTP server that waits `delay` before writing `response`.

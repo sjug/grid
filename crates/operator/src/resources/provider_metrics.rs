@@ -853,6 +853,13 @@ mod tests {
     use crate::crd::inference_provider::MetricsConfig;
 
     // -----------------------------------------------------------------------
+    // Constants
+    // -----------------------------------------------------------------------
+
+    /// Signal passes [`passes_over_two_providers_sharing_a_ca`] runs.
+    const SHARED_CA_PASSES: usize = 5;
+
+    // -----------------------------------------------------------------------
     // Test utilities
     // -----------------------------------------------------------------------
 
@@ -1394,6 +1401,31 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
                 .any(|observation| observation.metric == "queue_depth"),
             "metricsConfig.tls should override shared TLS"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "reproduces the per-pass TLS setup: once a CA is read and an endpoint connected, every \
+                later pass still rereads the CA for each provider sharing it and reconnects to each \
+                metrics endpoint; ignored until scrapes reuse both"]
+    async fn later_passes_reuse_the_shared_ca_and_the_connections() {
+        let cost = passes_over_two_providers_sharing_a_ca().await;
+
+        assert!(
+            cost.later_ca_reads == 0 && cost.later_handshakes == 0,
+            "CA reads: {} on the first provider's pass, {} more over the {} passes that a second provider \
+             sharing the CA joined; TLS handshakes after each provider's first scrape: {}",
+            cost.first_pass_ca_reads,
+            cost.later_ca_reads,
+            SHARED_CA_PASSES - 1,
+            cost.later_handshakes
+        );
+    }
+
+    #[tokio::test]
+    async fn the_shared_ca_scenario_reads_only_the_shared_ca() {
+        let cost = passes_over_two_providers_sharing_a_ca().await;
+
+        assert_eq!(cost.unexpected_api_requests, 0, "the scenario reads only the shared CA");
     }
 
     #[tokio::test]
@@ -2263,5 +2295,96 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
             }
         });
         (format!("http://{address}"), requests)
+    }
+    /// What the passes of [`passes_over_two_providers_sharing_a_ca`] cost beyond first use.
+    struct SharedCaPasses {
+        /// CA reads on the first pass, with the first provider alone.
+        first_pass_ca_reads: usize,
+        /// CA reads on the later passes, which a second provider sharing the CA joins.
+        later_ca_reads: usize,
+        /// TLS handshakes the metrics endpoints completed after their provider's first scrape.
+        later_handshakes: usize,
+        /// API requests other than reads of the shared CA.
+        unexpected_api_requests: usize,
+    }
+
+    /// Run [`SHARED_CA_PASSES`] back-to-back signal passes over two providers that take their CA
+    /// from one `ConfigMap` and have an HTTPS metrics endpoint each, with a sample of their own.
+    ///
+    /// The first provider is scraped alone on the first pass and the second joins from the next.
+    /// Every pass must scrape each provider it covers once and deliver that provider's own
+    /// sample, and the first pass must read the configured CA.
+    async fn passes_over_two_providers_sharing_a_ca() -> SharedCaPasses {
+        let ca = certs::generate_ca("shared-signals-ca").unwrap_or_else(|_| std::process::abort());
+        let (client, api) = crate::resources::test_doubles::counting_kube_client_with_config_map(
+            "grid",
+            "service-ca",
+            crate::resources::test_doubles::config_map_with_key("service-ca.crt", &ca.cert_pem),
+        );
+        let shared_ca = EndpointTlsConfig {
+            ca_secret_ref: None,
+            ca_config_map_ref: Some(crate::crd::inference_provider::ConfigMapKeyRef {
+                name: "service-ca".to_owned(),
+                namespace: "grid".to_owned(),
+                key: Some("service-ca.crt".to_owned()),
+            }),
+            client_certificate_secret_ref: None,
+        };
+        let mut endpoints = Vec::new();
+        for (name, first_pass, metrics, sample) in [
+            ("prov-a", 1, "queue_depth 0.25\nllm_d_epp_ready_endpoints 1\n", 0.25),
+            ("prov-b", 2, "queue_depth 0.75\nllm_d_epp_ready_endpoints 1\n", 0.75),
+        ] {
+            let (url, served) = crate::resources::test_doubles::start_counting_tls_metrics_server(&ca, metrics).await;
+            let mut provider = provider_fixture(name, &url, Some(mc_with_queue("queue_depth")));
+            provider.spec.tls = Some(shared_ca.clone());
+            endpoints.push((name, first_pass, sample, served, provider));
+        }
+        let readiness = crate::readiness::ReadinessStore::default();
+        let mut first_pass_ca_reads = 0;
+        let mut first_scrape_handshakes = 0;
+        for pass in 1..=SHARED_CA_PASSES {
+            let covered: Vec<_> = endpoints
+                .iter()
+                .filter(|(_, first_pass, ..)| *first_pass <= pass)
+                .map(|(.., provider)| provider.clone())
+                .collect();
+            collect_provider_signals("net", &covered, Some(&client), &readiness).await;
+            for (name, first_pass, sample, served, _) in &endpoints {
+                if *first_pass > pass {
+                    continue;
+                }
+                let own_sample = readiness
+                    .take_fresh(&format!("net/{name}"))
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|observation| {
+                        observation.metric == "queue_depth" && (observation.value - sample).abs() < f64::EPSILON
+                    });
+                assert!(own_sample, "pass {pass} must deliver {name} its own sample");
+                assert_eq!(
+                    served.scrapes.load(Ordering::SeqCst),
+                    pass + 1 - first_pass,
+                    "pass {pass} must scrape {name} once"
+                );
+                if *first_pass == pass {
+                    first_scrape_handshakes += served.handshakes.load(Ordering::SeqCst);
+                }
+            }
+            if pass == 1 {
+                first_pass_ca_reads = api.named_gets.load(Ordering::SeqCst);
+                assert!(first_pass_ca_reads > 0, "the first pass must read the configured CA");
+            }
+        }
+        let handshakes: usize = endpoints
+            .iter()
+            .map(|(.., served, _)| served.handshakes.load(Ordering::SeqCst))
+            .sum();
+        SharedCaPasses {
+            first_pass_ca_reads,
+            later_ca_reads: api.named_gets.load(Ordering::SeqCst) - first_pass_ca_reads,
+            later_handshakes: handshakes - first_scrape_handshakes,
+            unexpected_api_requests: api.unexpected.load(Ordering::SeqCst),
+        }
     }
 }

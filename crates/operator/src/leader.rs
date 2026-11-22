@@ -532,6 +532,9 @@ mod tests {
         Elector, LEASE_DURATION, LeaseStore, RENEW_DEADLINE, RETRY_EVERY, Record, StoreError, Tenure, takeable,
     };
 
+    /// Simulated time allowed for the candidate to acquire the free Lease.
+    const ACQUIRE_WITHIN: Duration = Duration::from_secs(4 * 60 * 60);
+
     /// A lease in memory, written by compare and swap on a counter.
     #[derive(Clone, Default)]
     struct Memory(Arc<Mutex<MemoryLease>>);
@@ -682,6 +685,48 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[ignore = "reproduces the unbounded acquisition attempt: a candidate whose lease read never answers waits on \
+                that one call, although the lease is free and the store answers every later call"]
+    async fn a_candidate_takes_a_free_lease_after_a_read_that_never_answers() {
+        let store = Unanswered::default();
+        store.leave(Leave::Next);
+        let mut candidate = Elector::new(store.clone(), "new");
+        let contending = tokio::spawn(async move { candidate.acquire().await });
+        tokio::time::timeout(ACQUIRE_WITHIN, contending)
+            .await
+            .expect("taken once a later read is answered")
+            .expect("task");
+        assert_eq!(store.lease.holder().as_deref(), Some("new"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[ignore = "reproduces the unbounded acquisition attempt: a candidate whose replica listing never answers waits \
+                on that one call, although the lease is free and the gate answers every later call"]
+    async fn a_candidate_takes_a_free_lease_after_a_replica_listing_that_never_answers() {
+        let api = Unanswered::default();
+        api.leave(Leave::Next);
+        let mut candidate = Elector::new(api.clone(), "new");
+        let contending = {
+            let gate = api.clone();
+            tokio::spawn(async move { candidate.acquire_when(&gate).await })
+        };
+        tokio::time::timeout(ACQUIRE_WITHIN, contending)
+            .await
+            .expect("taken once a later listing is answered")
+            .expect("task");
+        let answered = api.answered();
+        let listed_first = answered
+            .iter()
+            .take_while(|call| **call != Call::Put)
+            .any(|call| *call == Call::Check);
+        assert!(
+            listed_first,
+            "a listing is answered before the first lease write: {answered:?}"
+        );
+        assert_eq!(api.lease.holder().as_deref(), Some("new"));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn two_candidates_one_holder() {
         let store = Memory::default();
         let mut a = Elector::new(store.clone(), "a");
@@ -754,6 +799,21 @@ mod tests {
             held_for < LEASE_DURATION,
             "before a candidate could take over: {held_for:?}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_holder_whose_renewal_never_answers_counts_itself_lost_by_the_deadline() {
+        let store = Unanswered::default();
+        let mut a = Elector::new(store.clone(), "a");
+        a.acquire().await;
+        let renewed = Instant::now();
+        store.leave(Leave::All);
+        let tenure = tokio::time::timeout(LEASE_DURATION, a.hold_until(std::future::pending()))
+            .await
+            .expect("ended within the lease duration");
+        assert_eq!(tenure, Tenure::Lost);
+        let held_for = renewed.elapsed();
+        assert!(held_for <= RENEW_DEADLINE, "gave up by the deadline: {held_for:?}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -941,5 +1001,107 @@ mod tests {
         let taken = store().get().await.expect("get").expect("present").0;
         assert_eq!(taken.holder.as_deref(), Some("b"));
         assert_eq!(taken.transitions, 1, "one change of hands");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test Utilities
+    // -----------------------------------------------------------------------
+
+    /// A lease store and replica gate whose calls a test leaves unanswered, as a request that gets neither a
+    /// response nor a transport error. Answered calls are recorded in order and reach a lease in memory.
+    #[derive(Clone, Default)]
+    struct Unanswered {
+        /// The lease the answered reads and writes reach.
+        lease: Memory,
+        /// The calls answered so far, and which of those still to come stay pending.
+        script: Arc<Mutex<Script>>,
+    }
+
+    /// What an [`Unanswered`] has done and will do with its calls.
+    #[derive(Default)]
+    struct Script {
+        /// The calls answered so far, in order.
+        answered: Vec<Call>,
+        /// Which of the calls still to come stay pending.
+        leave: Leave,
+    }
+
+    /// One call on the replica gate or the lease store.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Call {
+        /// A replica listing.
+        Check,
+        /// A lease read.
+        Get,
+        /// A lease write.
+        Put,
+    }
+
+    /// Which calls stay pending.
+    #[derive(Clone, Copy, Default)]
+    enum Leave {
+        /// Every call from now on.
+        All,
+        /// The next call only; the ones after it are answered.
+        Next,
+        /// No call.
+        #[default]
+        Nothing,
+    }
+
+    impl Unanswered {
+        /// Records `call` as answered and returns, or never returns when the call is left pending.
+        async fn answer(&self, call: Call) {
+            let pending = {
+                let mut script = self.script.lock().unwrap_or_else(PoisonError::into_inner);
+                match script.leave {
+                    Leave::All => true,
+                    Leave::Next => {
+                        script.leave = Leave::Nothing;
+                        true
+                    },
+                    Leave::Nothing => {
+                        script.answered.push(call);
+                        false
+                    },
+                }
+            };
+            if pending {
+                std::future::pending::<()>().await;
+            }
+        }
+
+        /// The calls answered so far, in order.
+        fn answered(&self) -> Vec<Call> {
+            self.script
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .answered
+                .clone()
+        }
+
+        /// Sets which of the calls still to come stay pending.
+        fn leave(&self, leave: Leave) {
+            self.script.lock().unwrap_or_else(PoisonError::into_inner).leave = leave;
+        }
+    }
+
+    impl LeaseStore for Unanswered {
+        async fn get(&self) -> Result<Option<(Record, String)>, StoreError> {
+            self.answer(Call::Get).await;
+            self.lease.get().await
+        }
+
+        async fn put(&self, version: Option<&str>, record: &Record) -> Result<String, StoreError> {
+            self.answer(Call::Put).await;
+            self.lease.put(version, record).await
+        }
+    }
+
+    impl crate::unelected::ContendGate for Unanswered {
+        async fn check(&self) -> Result<(), crate::unelected::Waiting> {
+            self.answer(Call::Check).await;
+            Ok(())
+        }
     }
 }
